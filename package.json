@@ -4,12 +4,17 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
+    "start": "vite",
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "db:check": "node scripts/check-supabase-connection.mjs",
+    "db:schema": "node scripts/apply-schema.mjs"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.100.1",
+    "pg": "^8.20.0",
     "react": "^19.2.4",
     "react-dom": "^19.2.4"
   },
