@@ -1,14 +1,24 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import EmptyState from './components/EmptyState.jsx'
+import LoginPage from './components/LoginPage.jsx'
 import ShowCard from './components/ShowCard.jsx'
 import ShowModal from './components/ShowModal.jsx'
 import {
   createShow,
   deleteShow,
   listShows,
+  setShowFavorited,
   updateShow,
 } from './data/showsRepository.js'
-import { ensureSupabaseSession, hasSupabaseConfig } from './lib/supabase.js'
+import {
+  getCurrentSessionUser,
+  hasSupabaseConfig,
+  signInGuest,
+  signInWithEmail,
+  signOut,
+  signUpWithEmail,
+  supabase,
+} from './lib/supabase.js'
 import {
   incrementEpisode,
   loadShows,
@@ -41,7 +51,15 @@ export default function App() {
   const [syncMode, setSyncMode] = useState(hasSupabaseConfig ? 'supabase' : 'local')
   const [statusMessage, setStatusMessage] = useState('')
   const [supabaseUserId, setSupabaseUserId] = useState(null)
+  const [authMode, setAuthMode] = useState('signin')
+  const [authActionLoading, setAuthActionLoading] = useState(false)
   const searchInputRef = useRef(null)
+
+  const loadRemoteShows = useCallback(async () => {
+    const rows = await listShows()
+    setShows(rows)
+    setStatusMessage('Synced with Supabase.')
+  }, [])
 
   useEffect(() => {
     let active = true
@@ -58,15 +76,24 @@ export default function App() {
         return
       }
 
-      const { user, error: sessionError } = await ensureSupabaseSession()
+      const { user, error: sessionError } = await getCurrentSessionUser()
       if (!active) return
 
-      if (sessionError || !user) {
+      if (sessionError) {
         setSyncMode('local')
         setShows(sortShowsByRecent(loadShows()))
         setStatusMessage(
-          'Supabase sign-in failed. Enable anonymous auth in Supabase or provide a user session.',
+          'Supabase session check failed. Using local mode.',
         )
+        setLoading(false)
+        return
+      }
+
+      if (!user) {
+        setSyncMode('supabase')
+        setShows([])
+        setSupabaseUserId(null)
+        setStatusMessage('Sign in to sync your library.')
         setLoading(false)
         return
       }
@@ -93,6 +120,27 @@ export default function App() {
       active = false
     }
   }, [])
+
+  useEffect(() => {
+    if (!supabase) return undefined
+
+    const { data } = supabase.auth.onAuthStateChange((_event, session) => {
+      const userId = session?.user?.id ?? null
+      setSupabaseUserId(userId)
+      if (!userId) {
+        setShows([])
+        setStatusMessage('Signed out.')
+      } else {
+        loadRemoteShows().catch(() => {
+          setStatusMessage('Failed to refresh data after sign in.')
+        })
+      }
+    })
+
+    return () => {
+      data.subscription.unsubscribe()
+    }
+  }, [loadRemoteShows])
 
   useEffect(() => {
     if (syncMode === 'local') {
@@ -123,12 +171,90 @@ export default function App() {
     searchInputRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })
   }, [])
 
+  const handleSignIn = useCallback(async (email, password) => {
+    setAuthActionLoading(true)
+    try {
+      const { user, error } = await signInWithEmail(email, password)
+      if (error || !user) {
+        setStatusMessage(error?.message ?? 'Unable to sign in.')
+        return
+      }
+      setSupabaseUserId(user.id)
+      await loadRemoteShows()
+    } finally {
+      setAuthActionLoading(false)
+    }
+  }, [loadRemoteShows])
+
+  const handleSignUp = useCallback(async (email, password) => {
+    setAuthActionLoading(true)
+    try {
+      const { user, error } = await signUpWithEmail(email, password)
+      if (error) {
+        setStatusMessage(error.message)
+        return
+      }
+      if (!user) {
+        setStatusMessage('Check your email to confirm your account, then sign in.')
+        return
+      }
+      setSupabaseUserId(user.id)
+      await loadRemoteShows()
+    } finally {
+      setAuthActionLoading(false)
+    }
+  }, [loadRemoteShows])
+
+  const handleGuestSignIn = useCallback(async () => {
+    setAuthActionLoading(true)
+    try {
+      const { user, error } = await signInGuest()
+      if (error || !user) {
+        setStatusMessage(error?.message ?? 'Unable to continue as guest.')
+        return
+      }
+      setSupabaseUserId(user.id)
+      await loadRemoteShows()
+    } finally {
+      setAuthActionLoading(false)
+    }
+  }, [loadRemoteShows])
+
+  const handleSignOut = useCallback(async () => {
+    const { error } = await signOut()
+    if (error) {
+      setStatusMessage('Failed to sign out.')
+      return
+    }
+    setSupabaseUserId(null)
+    setShows([])
+    setStatusMessage('Signed out.')
+  }, [])
+
   const handleSave = useCallback(
     async (data) => {
       try {
         if (modal.mode === 'add') {
+          const base = {
+            title: data.title,
+            season: data.season,
+            episode: data.episode,
+            notes: data.notes,
+          }
+          let payload = { ...base }
+          if (data.skipTvmaze) {
+            payload.posterUrl = null
+            payload.tvmazeShowId = null
+            payload.subtitle = null
+          } else if (data.tvmazePick) {
+            const p = data.tvmazePick
+            payload.posterUrl = p.posterUrl
+            payload.tvmazeShowId = p.tvmazeShowId
+            payload.subtitle = p.subtitle ?? null
+          }
+
           if (syncMode === 'supabase') {
-            const created = await createShow(data, supabaseUserId)
+            const created = await createShow(payload, supabaseUserId)
             setShows((prev) => sortShowsByRecent([created, ...prev]))
           } else {
             setShows((prev) =>
@@ -138,7 +264,8 @@ export default function App() {
                   id:
                     globalThis.crypto?.randomUUID?.() ??
                     `show-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-                  ...data,
+                  ...payload,
+                  favorited: false,
                   lastWatched: new Date().toISOString(),
                 },
               ]),
@@ -146,8 +273,21 @@ export default function App() {
           }
         } else if (modal.show) {
           const id = modal.show.id
+          const payload = {
+            title: data.title,
+            season: data.season,
+            episode: data.episode,
+            notes: data.notes,
+          }
+          if (data.tvmazePick) {
+            const p = data.tvmazePick
+            payload.posterUrl = p.posterUrl
+            payload.tvmazeShowId = p.tvmazeShowId
+            payload.subtitle = p.subtitle ?? null
+          }
+
           if (syncMode === 'supabase') {
-            const updated = await updateShow(id, data)
+            const updated = await updateShow(id, payload)
             setShows((prev) =>
               sortShowsByRecent(prev.map((s) => (s.id === id ? updated : s))),
             )
@@ -158,7 +298,7 @@ export default function App() {
                   s.id === id
                     ? {
                         ...s,
-                        ...data,
+                        ...payload,
                         lastWatched: new Date().toISOString(),
                       }
                     : s,
@@ -223,6 +363,61 @@ export default function App() {
     [shows, syncMode],
   )
 
+  const handleToggleFavorite = useCallback(
+    async (showId) => {
+      const current = shows.find((s) => s.id === showId)
+      if (!current) return
+      const next = !current.favorited
+
+      try {
+        if (syncMode === 'supabase') {
+          const updated = await setShowFavorited(showId, next)
+          setShows((prev) =>
+            sortShowsByRecent(
+              prev.map((s) => (s.id === showId ? updated : s)),
+            ),
+          )
+        } else {
+          setShows((prev) =>
+            sortShowsByRecent(
+              prev.map((s) =>
+                s.id === showId ? { ...s, favorited: next } : s,
+              ),
+            ),
+          )
+        }
+      } catch {
+        setStatusMessage('Could not update favorite.')
+      }
+    },
+    [shows, syncMode],
+  )
+
+  if (
+    !loading &&
+    syncMode === 'supabase' &&
+    hasSupabaseConfig &&
+    !supabaseUserId
+  ) {
+    return (
+      <div className="relative min-h-dvh">
+        <div className="dot-grid" aria-hidden />
+        <div className="grain" aria-hidden />
+        <LoginPage
+          loading={authActionLoading}
+          mode={authMode}
+          message={statusMessage}
+          onSignIn={handleSignIn}
+          onSignUp={handleSignUp}
+          onGuest={handleGuestSignIn}
+          onToggleMode={() =>
+            setAuthMode((prev) => (prev === 'signin' ? 'signup' : 'signin'))
+          }
+        />
+      </div>
+    )
+  }
+
   return (
     <div className="relative min-h-dvh pb-24 md:pb-8">
       <div className="dot-grid" aria-hidden />
@@ -249,6 +444,15 @@ export default function App() {
             >
               + Add show
             </button>
+            {syncMode === 'supabase' ? (
+              <button
+                type="button"
+                onClick={handleSignOut}
+                className="hidden rounded-xl border border-white/15 px-4 py-3 text-xs font-semibold uppercase tracking-wide text-[#a0a0ab] transition hover:border-white/30 hover:text-white sm:inline-flex"
+              >
+                Sign out
+              </button>
+            ) : null}
           </div>
 
           <p className="max-w-xl text-sm leading-relaxed text-[#a0a0ab]">
@@ -258,6 +462,27 @@ export default function App() {
           <p className="text-xs text-[#6b6b75]">
             Sync: {syncMode === 'supabase' ? 'Supabase' : 'Local storage'}{' '}
             {statusMessage ? `- ${statusMessage}` : ''}
+          </p>
+          <p className="text-[11px] text-[#6b6b75]">
+            Posters from{' '}
+            <a
+              href="https://www.tvmaze.com/"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-[#a0a0ab] underline decoration-white/20 underline-offset-2 hover:text-white"
+            >
+              TVmaze
+            </a>{' '}
+            (CC BY-SA). Search API:{' '}
+            <a
+              href="https://api.tvmaze.com/search/shows?q=girls"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-[#a0a0ab] underline decoration-white/20 underline-offset-2 hover:text-white"
+            >
+              api.tvmaze.com
+            </a>
+            .
           </p>
 
           <div>
@@ -323,6 +548,7 @@ export default function App() {
                       index={index}
                       onEdit={openEdit}
                       onIncrementEpisode={handleIncrementEpisode}
+                      onToggleFavorite={handleToggleFavorite}
                     />
                   </li>
                 ))}

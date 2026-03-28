@@ -41,6 +41,9 @@ export function incrementEpisode(show) {
 
 export function sortShowsByRecent(shows) {
   return [...shows].sort((a, b) => {
+    const fa = a.favorited ? 1 : 0
+    const fb = b.favorited ? 1 : 0
+    if (fa !== fb) return fb - fa
     const ta = new Date(a.lastWatched || 0).getTime()
     const tb = new Date(b.lastWatched || 0).getTime()
     return tb - ta
